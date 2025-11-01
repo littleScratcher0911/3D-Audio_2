@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>3D Audio Demo - Robust</title>
+  <style>
+    body { background: #222; color: #fff; font-family: sans-serif; text-align: center; }
+    #container { margin: 16px auto; width: 540px; }
+    canvas { background: #333; display: block; margin: 12px auto; border: 2px solid #666; }
+    #controls { margin-top: 8px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap; }
+    #status { margin-top:12px; color:#ffa; }
+    #fileInput { color: #000; }
+    button { padding:6px 10px; }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <h2>3D Audio Demo</h2>
+    <canvas id="area" width="500" height="500"></canvas>
+    <div id="controls">
+      <button id="play">Play Sound</button>
+      <button id="stop">Stop</button>
+      <button id="testTone">Testton</button>
+      <input id="fileInput" type="file" accept=".mp3, .m4a, .wav">
+    </div>
+    <p>
+      Ziehe den Punkt über die Fläche.<br>
+      Die Position bestimmt, woher das Geräusch kommt.<br>
+      <small>(Kopfhörer empfohlen!)</small>
+    </p>
+    <div id="status">Status: Bereit</div>
+  </div>
+
+  <script>
+    // --------------------
+    // State / Audio Vars
+    // --------------------
+    let audioCtx = null;
+    let source = null;         // BufferSource
+    let oscillator = null;     // Fallback test tone
+    let panner = null;
+    let gainNode = null;
+    let buffer = null;
+    let playing = false;
+    let usingOscillator = false;
+
+    const statusEl = document.getElementById('status');
+
+    function setStatus(msg) {
+      statusEl.textContent = "Status: " + msg;
+      console.log("[STATUS]", msg);
+    }
+
+    // --------------------
+    // Utilities
+    // --------------------
+    async function ensureAudioContext() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        console.log("AudioContext created:", audioCtx);
+      }
+      // resume on user gesture if suspended
+      if (audioCtx.state === 'suspended') {
+        try { await audioCtx.resume(); console.log("audioCtx resumed"); } catch(e){ console.warn("resume failed", e); }
+      }
+      return audioCtx;
+    }
+
+    async function loadAudioFromUrl(url = "audio-from-video.wav") {
+      setStatus("Lade " + url + " ...");
+      try {
+        await ensureAudioContext();
+      } catch (e) {
+        setStatus("AudioContext konnte nicht erstellt werden");
+        throw e;
+      }
+
+      try {
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          throw new Error("Fetch failed: " + resp.status + " " + resp.statusText);
+        }
+        const arrayBuffer = await resp.arrayBuffer();
+        const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+        buffer = decoded;
+        setStatus("Audio geladen: Dauer " + buffer.duration.toFixed(2) + "s");
+        console.log("Audio buffer decoded:", buffer);
+        return buffer;
+      } catch (err) {
+        console.error("loadAudioFromUrl error:", err);
+        setStatus("Fehler beim Laden (verwende Datei-Input oder Testton)");
+        throw err;
+      }
+    }
+
+    function loadAudioFromFile(file) {
+      return new Promise(async (resolve, reject) => {
+        if (!file) { reject(new Error("Keine Datei")); return; }
+        setStatus("Lese Datei: " + file.name);
+        try { await ensureAudioContext(); } catch(e){ reject(e); return; }
+
+        const fr = new FileReader();
+        fr.onload = async () => {
+          try {
+            const arrayBuffer = fr.result;
+            const decoded = await audioCtx.decodeAudioData(arrayBuffer);
+            buffer = decoded;
+            setStatus("Datei geladen: " + file.name + " (" + buffer.duration.toFixed(2) + "s)");
+            console.log("Decoded from file:", file.name, buffer);
+            // Kein Zurücksetzen des File-Inputs!
+            resolve(buffer);
+          } catch (err) {
+            console.error("decodeAudioData failed:", err);
+            setStatus("Fehler beim Dekodieren der Datei");
+            reject(err);
+          }
+        };
+        fr.onerror = (e) => {
+          console.error("FileReader error", e);
+          setStatus("Fehler beim Lesen der Datei");
+          reject(e);
+        };
+        fr.readAsArrayBuffer(file);
+      });
+    }
+
+    // --------------------
+    // Playback
+    // --------------------
+    function setupPannerAndGain() {
+      panner = audioCtx.createPanner();
+      // Try set properties, ignore if not supported
+      try {
+        panner.panningModel = 'HRTF';
+        panner.distanceModel = 'linear';
+        panner.refDistance = 1;
+        panner.maxDistance = 10;
+      } catch(e){ console.warn("panner property set failed", e); }
+
+      gainNode = audioCtx.createGain();
+      gainNode.gain.value = 1;
+
+      // connect in correct order later depending on source type
+    }
+
+    function playBuffer() {
+      if (!buffer) {
+        console.warn("No buffer to play");
+        setStatus("Kein Audio geladen (lade Datei oder URL oder benutze Testton)");
+        return;
+      }
+      try {
+        if (!audioCtx) return;
+        source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.loop = true;
+        setupPannerAndGain();
+        source.connect(panner);
+        panner.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        source.start(0);
+        playing = true;
+        usingOscillator = false;
+        setStatus("Wiedergabe gestartet");
+        updatePanner(); // initial position
+        source.onended = () => { playing = false; setStatus("Beendet"); };
+      } catch (e) {
+        console.error("playBuffer error", e);
+        setStatus("Fehler beim Abspielen");
+      }
+    }
+
+    async function playOscillator() {
+      try {
+        await ensureAudioContext();
+      } catch(e){
+        setStatus("AudioContext nicht verfügbar");
+        return;
+      }
+      try {
+        oscillator = audioCtx.createOscillator();
+        oscillator.type = 'sine';
+        oscillator.frequency.value = 440;
+        setupPannerAndGain();
+        oscillator.connect(panner);
+        panner.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        oscillator.start();
+        playing = true;
+        usingOscillator = true;
+        setStatus("Testton läuft");
+        updatePanner();
+      } catch (e) {
+        console.error("playOscillator error", e);
+        setStatus("Fehler beim Testton");
+      }
+    }
+
+    function stopAudio() {
+      try {
+        if (usingOscillator && oscillator) {
+          oscillator.stop();
+          oscillator.disconnect();
+          oscillator = null;
+        }
+        if (source) {
+          try { source.stop(); } catch (e) { /* may already be stopped */ }
+          try { source.disconnect(); } catch(e) {}
+          source = null;
+        }
+        if (panner) {
+          try { panner.disconnect(); } catch(e) {}
+          panner = null;
+        }
+        if (gainNode) {
+          try { gainNode.disconnect(); } catch(e) {}
+          gainNode = null;
+        }
+      } catch (e) {
+        console.warn("stopAudio error", e);
+      }
+      playing = false;
+      usingOscillator = false;
+      setStatus("Gestoppt");
+    }
+
+    // --------------------
+    // Panner update & Canvas
+    // --------------------
+    const canvas = document.getElementById("area");
+    const ctx2d = canvas.getContext("2d");
+    const areaW = canvas.width, areaH = canvas.height;
+    const center = {x: areaW/2, y: areaH/2};
+    let dot = {x: areaW/2, y: areaH/2, r: 18};
+    let dragging = false;
+
+    function draw() {
+      ctx2d.clearRect(0, 0, areaW, areaH);
+      // Hilfslinien
+      ctx2d.strokeStyle = "#888";
+      ctx2d.lineWidth = 2;
+      ctx2d.beginPath();
+      ctx2d.moveTo(center.x, 0); ctx2d.lineTo(center.x, areaH); // vertikal
+      ctx2d.moveTo(0, center.y); ctx2d.lineTo(areaW, center.y); // horizontal
+      ctx2d.stroke();
+
+      // Markierungen
+      ctx2d.fillStyle = "#fff";
+      ctx2d.font = "18px sans-serif";
+      ctx2d.fillText("Vorne", center.x-28, 30);
+      ctx2d.fillText("Hinten", center.x-35, areaH-15);
+      ctx2d.fillText("Links", 10, center.y-10);
+      ctx2d.fillText("Rechts", areaW-70, center.y-10);
+      ctx2d.fillStyle = "#ff0";
+      ctx2d.fillText("Mitte", center.x-30, center.y-30);
+
+      // Punkt
+      ctx2d.beginPath();
+      ctx2d.arc(dot.x, dot.y, dot.r, 0, Math.PI*2);
+      ctx2d.fillStyle = "#0af";
+      ctx2d.fill();
+      ctx2d.strokeStyle = "#fff";
+      ctx2d.lineWidth = 3;
+      ctx2d.stroke();
+    }
+
+    function updatePanner() {
+      if (!panner || !audioCtx) return;
+      // Normiere Koordinaten: -1 bis 1
+      let relX = (dot.x - center.x) / (areaW/2);
+      let relY = (dot.y - center.y) / (areaH/2);
+      // Web Audio: x=links/rechts, z=vor/hinten (neg. z ist vorne)
+      const posX = relX * 2; // -2 bis 2
+      const posY = 0;
+      const posZ = relY * 2; // -2 bis 2
+
+      if (panner.positionX && typeof panner.positionX.setValueAtTime === 'function') {
+        try {
+          const t = audioCtx.currentTime || 0;
+          panner.positionX.setValueAtTime(posX, t);
+          panner.positionY.setValueAtTime(posY, t);
+          panner.positionZ.setValueAtTime(posZ, t);
+        } catch (e) {
+          try { panner.setPosition(posX, posY, posZ); } catch(e2) { console.warn("panner set position failed", e2); }
+        }
+      } else {
+        try { panner.setPosition(posX, posY, posZ); } catch(e) {}
+      }
+
+      // Lautstärke verringern, je weiter hinten (aber mind. 0.05)
+      if (gainNode && gainNode.gain) {
+        const newGain = Math.max(0.05, 1 - Math.abs(relY) * 0.5);
+        try {
+          if (typeof gainNode.gain.setValueAtTime === 'function') {
+            gainNode.gain.setValueAtTime(newGain, audioCtx.currentTime || 0);
+          } else {
+            gainNode.gain.value = newGain;
+          }
+        } catch(e) {
+          try { gainNode.gain.value = newGain; } catch(e2) {}
+        }
+      }
+      console.log("panner update:", posX.toFixed(2), posZ.toFixed(2), "gain:", gainNode ? gainNode.gain.value : "n/a");
+    }
+
+    // --------------------
+    // Drag & Touch Handling
+    // --------------------
+    canvas.addEventListener("mousedown", (e) => {
+      let rect = canvas.getBoundingClientRect();
+      let mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      if (Math.hypot(mx-dot.x, my-dot.y) <= dot.r) dragging = true;
+    });
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      let rect = canvas.getBoundingClientRect();
+      dot.x = Math.max(dot.r, Math.min(areaW-dot.r, e.clientX - rect.left));
+      dot.y = Math.max(dot.r, Math.min(areaH-dot.r, e.clientY - rect.top));
+      draw();
+      updatePanner();
+    });
+    window.addEventListener("mouseup", () => dragging = false);
+
+    canvas.addEventListener("touchstart", (e) => {
+      const t = e.touches[0];
+      let rect = canvas.getBoundingClientRect();
+      let mx = t.clientX - rect.left, my = t.clientY - rect.top;
+      if (Math.hypot(mx-dot.x, my-dot.y) <= dot.r) {
+        dragging = true;
+        e.preventDefault();
+      }
+    }, {passive:false});
+    canvas.addEventListener("touchmove", (e) => {
+      if (!dragging) return;
+      const t = e.touches[0];
+      let rect = canvas.getBoundingClientRect();
+      dot.x = Math.max(dot.r, Math.min(areaW-dot.r, t.clientX - rect.left));
+      dot.y = Math.max(dot.r, Math.min(areaH-dot.r, t.clientY - rect.top));
+      draw();
+      updatePanner();
+      e.preventDefault();
+    }, {passive:false});
+    window.addEventListener("touchend", () => dragging = false);
+
+    // --------------------
+    // UI Bindings
+    // --------------------
+    document.getElementById("play").onclick = async () => {
+      setStatus("Starte Wiedergabe...");
+      try {
+        await ensureAudioContext();
+      } catch (e) {
+        setStatus("AudioContext konnte nicht erstellt werden");
+        return;
+      }
+      // Wenn Buffer bereits geladen -> spiele
+      if (buffer) { playBuffer(); return; }
+
+      // Versuch, Standard-Datei per fetch zu laden
+      try {
+        await loadAudioFromUrl();
+        if (buffer) { playBuffer(); return; }
+      } catch (e) {
+        // fetch/decoding schlug fehl -> weiche auf Testton hinweisen
+        setStatus("Konnte Audio nicht laden. Benutze Datei-Input oder Testton.");
+        console.warn("Fetch/Decode fehlgeschlagen, bitte Datei wählen oder Testton verwenden.");
+      }
+    };
+
+    document.getElementById("stop").onclick = () => { stopAudio(); };
+
+    document.getElementById("testTone").onclick = async () => {
+      try { await ensureAudioContext(); } catch(e){ setStatus("AudioContext Fehler"); return; }
+      stopAudio();
+      await playOscillator();
+    };
+
+    document.getElementById("fileInput").addEventListener("change", async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      try {
+        await loadAudioFromFile(f);
+      } catch (err) {
+        console.error("file load failed", err);
+      }
+    });
+
+    // Initial draw
+    draw();
+    setStatus("Bereit — Testton drücken, oder Datei laden.");
+
+    // Debug helper: if no audio, show console tips
+    console.log("Wenn kein Ton: 1) öffne DevTools Console 2) teste Testton 3) lade Datei oder benutze lokalen http-server (python -m http.server).");
+  </script>
+</body>
+</html>
